@@ -31,6 +31,11 @@ function transfer_gitlab_ci_cd_variables() {
     return 1
   fi
 
+  if ! which sed &> /dev/null; then
+    echo '"sed" is not installed!' >&2
+    return 1
+  fi
+
   # Arguments for "curl" commands
   declare -a curl_extra_args=(
     # Follow redirects
@@ -43,33 +48,170 @@ function transfer_gitlab_ci_cd_variables() {
 
     # Fail command if response code is not 200
     --fail
-
-    --header "PRIVATE-TOKEN: ${gitlab_project_1_api_token}"
   )
   if [ -n "${proxy}" ]; then
     curl_extra_args+=("--proxy" "${proxy}")
   fi
 
-  local gitlab_hostname
-  gitlab_hostname="$(echo "${gitlab_project_1_url}" | sed -r 's#^https?://([^/]+)/.*$#\1#')" || return "$?"
-  if [ -z "${gitlab_hostname}" ]; then
-    echo "Failed to extract GitLab hostname from '${gitlab_project_1_url}'" >&2
+  # Arguments for "curl" commands to first GitLab
+  declare -a curl_extra_args_for_gitlab_1=(
+    "${curl_extra_args[@]}"
+    --header "PRIVATE-TOKEN: ${gitlab_project_1_api_token}"
+  )
+  # Arguments for "curl" commands to second GitLab
+  declare -a curl_extra_args_for_gitlab_2=(
+    "${curl_extra_args[@]}"
+    --header "PRIVATE-TOKEN: ${gitlab_project_2_api_token}"
+  )
+
+  local gitlab_hostname_1
+  gitlab_hostname_1="$(echo "${gitlab_project_1_url}" | sed -r 's#^https?://([^/]+)/.*$#\1#')" || return "$?"
+  if [ -z "${gitlab_hostname_1}" ]; then
+    echo "Failed to extract GitLab hostname from \"${gitlab_project_1_url}\"!" >&2
     return 1
   fi
 
-  local projects_info
-  projects_info="$(curl "${curl_extra_args[@]}" "https://${gitlab_hostname}/api/v4/projects")" || return "$?"
+  local gitlab_hostname_2
+  gitlab_hostname_2="$(echo "${gitlab_project_2_url}" | sed -r 's#^https?://([^/]+)/.*$#\1#')" || return "$?"
+  if [ -z "${gitlab_hostname_1}" ]; then
+    echo "Failed to extract GitLab hostname from \"${gitlab_project_2_url}\"!" >&2
+    return 1
+  fi
 
-  local project_info
-  project_info="$(echo "${projects_info}" | jq -r ".[] | select(.web_url == \"${gitlab_project_1_url}\")")" || return "$?"
+  local project_1_name
+  project_1_name="${gitlab_project_1_url##*/}" || return "$?"
+  echo "Project 1 name: ${project_1_name}"
 
-  local project_id
-  project_id="$(echo "${project_info}" | jq -r '.id')" || return "$?"
+  local project_2_name
+  project_2_name="${gitlab_project_2_url##*/}" || return "$?"
+  echo "Project 2 name: ${project_2_name}"
 
-  local project_api
-  project_api="https://${gitlab_hostname}/api/v4/projects/${project_id}/variables"
+  local projects_info_1
+  projects_info_1="$(curl "${curl_extra_args_for_gitlab_1[@]}" "https://${gitlab_hostname_1}/api/v4/projects?search=${project_1_name}")" || return "$?"
 
-  curl "${curl_extra_args[@]}" "${project_api}" | jq -r '.[] | .key, .value, ""' || return "$?"
+  local projects_info_2
+  projects_info_2="$(curl "${curl_extra_args_for_gitlab_2[@]}" "https://${gitlab_hostname_2}/api/v4/projects?search=${project_2_name}")" || return "$?"
+
+  local project_info_1
+  project_info_1="$(echo "${projects_info_1}" | jq -r ".[] | select(.web_url == \"${gitlab_project_1_url}\")")" || return "$?"
+  # DEBUG:
+  # echo "Project 1 info: ${projects_info_1}"
+
+  local project_info_2
+  project_info_2="$(echo "${projects_info_2}" | jq -r ".[] | select(.web_url == \"${gitlab_project_2_url}\")")" || return "$?"
+  # DEBUG:
+  # echo "Project 2 info: ${projects_info_2}"
+
+  local project_id_1
+  project_id_1="$(echo "${project_info_1}" | jq -r '.id')" || return "$?"
+  if [ -z "${project_id_1}" ]; then
+    echo "Failed to extract project 1 ID from the project info!" >&2
+    return 1
+  fi
+
+  # DEBUG:
+  echo "Project 1 ID: ${project_id_1}"
+
+  local project_id_2
+  project_id_2="$(echo "${project_info_2}" | jq -r '.id')" || return "$?"
+  if [ -z "${project_id_2}" ]; then
+    echo "Failed to extract project 2 ID from the project info!" >&2
+    return 1
+  fi
+
+  # DEBUG:
+  echo "Project 2 ID: ${project_id_2}"
+
+  local is_all_pages_parsed=0
+
+  local page=1
+
+  # GitLab allows max 100 items per page
+  local per_page=100
+
+  while ((!is_all_pages_parsed)); do
+    local project_api_1
+    project_api_1="https://${gitlab_hostname_1}/api/v4/projects/${project_id_1}/variables?per_page=${per_page}&page=${page}"
+
+    local project_1_headers_filename="/tmp/project_1_headers.txt"
+
+    local project_1_ci_cd_variables
+    project_1_ci_cd_variables="$(curl "${curl_extra_args_for_gitlab_1[@]}" --dump-header "${project_1_headers_filename}" "${project_api_1}")" || return "$?"
+
+    # DEBUG:
+    # echo "${project_1_ci_cd_variables}" | jq || return "$?"
+
+    local total_pages
+    total_pages="$(sed -En 's/^x-total-pages: ([0-9]+)\s+$/\1/p' "${project_1_headers_filename}")" || return "$?"
+    if [ -z "${total_pages}" ]; then
+      echo "Failed to extract total pages from headers!" >&2
+      return 1
+    fi
+
+    local variables_count
+    variables_count="$(echo "${project_1_ci_cd_variables}" | jq 'length')" || return "$?"
+    if [ -z "${variables_count}" ]; then
+      echo "Failed to extract variables count!" >&2
+      return 1
+    fi
+
+    local variable_id_on_page
+    for ((variable_id_on_page = 0; variable_id_on_page < variables_count; variable_id_on_page++)); do
+      local variable
+      variable="$(echo "${project_1_ci_cd_variables}" | jq ".[${variable_id_on_page}]")" || return "$?"
+
+      local variable_key
+      variable_key="$(echo "${variable}" | jq -r '.key')" || return "$?"
+
+      local variable_value
+      variable_value="$(echo "${variable}" | jq -r '(.value // "")')" || return "$?"
+
+      local variable_protected
+      variable_protected="$(echo "${variable}" | jq -r '.protected')" || return "$?"
+
+      local variable_masked
+      variable_masked="$(echo "${variable}" | jq -r '.masked')" || return "$?"
+
+      local variable_hidden
+      variable_hidden="$(echo "${variable}" | jq -r '.hidden')" || return "$?"
+
+      local variable_raw
+      variable_raw="$(echo "${variable}" | jq -r '.raw')" || return "$?"
+
+      local variable_environment_scope
+      variable_environment_scope="$(echo "${variable}" | jq -r '.environment_scope')" || return "$?"
+
+      local variable_description
+      variable_description="$(echo "${variable}" | jq -r '(.description // "")')" || return "$?"
+
+      # Check if variable exists
+      if curl "${curl_extra_args_for_gitlab_2[@]}" --head "https://${gitlab_hostname_2}/api/v4/projects/${project_id_2}/variables/${variable_key}?filter%5Benvironment_scope%5D=${variable_environment_scope}" &> /dev/null; then
+        echo "Variable \"${variable_key}\" already exists in the second project for scope \"${variable_environment_scope}\" - skipping it" >&2
+        continue
+      fi
+
+      # Create variable
+      curl "${curl_extra_args_for_gitlab_2[@]}" --request POST "https://${gitlab_hostname_2}/api/v4/projects/${project_id_2}/variables" \
+        --form "key=${variable_key}" \
+        --form "value=${variable_value}" \
+        --form "protected=${variable_protected}" \
+        --form "masked=${variable_masked}" \
+        --form "hidden=${variable_hidden}" \
+        --form "raw=${variable_raw}" \
+        --form "environment_scope=${variable_environment_scope}" \
+        --form "description=${variable_description}" \
+        > /dev/null || return "$?"
+      echo "Created variable \"${variable_key}\" in the second project for scope \"${variable_environment_scope}\"!" >&2
+    done
+
+    echo "Variables page ${page}/${total_pages} parsed (${per_page} variables per page)!" >&2
+
+    if ((page < total_pages)); then
+      ((page++))
+    else
+      is_all_pages_parsed=1
+    fi
+  done
 }
 
 transfer_gitlab_ci_cd_variables "$@" || exit "$?"
