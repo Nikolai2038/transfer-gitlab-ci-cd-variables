@@ -1,3 +1,10 @@
+# Ignore all other files, so it will be easy to store custom scripts in the same directory without them interfering with the repository work
 *
 !.gitignore
 !/transfer-gitlab-ci-cd-variables.sh
+
+# License
+/LICENSE
+
+# READMEs
+!/*.md
